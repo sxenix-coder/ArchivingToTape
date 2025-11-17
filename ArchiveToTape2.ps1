@@ -2,7 +2,7 @@
 # Folder-Level Tape Archiving Script
 # HPE LTO-9 + Windows Server 2025
 # Features:
-# - Robust tape label detection with multiple fallback methods
+# - Bulletproof tape label detection using the 'vol' command
 # - Folder-level atomic copying using Robocopy for resilience
 # - Comprehensive logging to file and console
 # - Email alert when tape is almost full
@@ -10,11 +10,12 @@
 # ----------------------------
 
 # CONFIGURATION
-$SourceDir = "\\Test-srv\sushan"          # Network source to archive
+$SourceDir = "\\Test-Srv\sushan"          # Network source to archive
 $TapeDrive = "F:"                                  # LTO-9 tape drive (LTFS-mounted)
 $IndexFile = "C:\TapeAutomation\TapeIndex.csv"
 $LogFile = "C:\TapeAutomation\Logs\ArchiveLog.txt"
-$TapeFullThreshold = 100GB                         # Reserve buffer to avoid overfill
+$TapeFullThreshold = 100GB           # Reserve buffer to avoid overfill
+
 
 # EMAIL CONFIGURATION
 $EmailFrom   = "sxenix@gmail.com"
@@ -23,7 +24,7 @@ $SMTPServer  = "smtp.gmail.com"
 $SMTPPort    = 587
 $UseSSL      = $true
 $EmailUser   = "sxenix@gmail.com"
-$EmailPass   = "YOUR_APP_PASSWORD"                 # Replace with Google App Password
+$EmailPass   = "YOUR_APP_PASSWORD"                # Replace with Google App Password
 
 # LOG FUNCTION
 Function Log-Message {
@@ -35,53 +36,43 @@ Function Log-Message {
     Write-Host $timestampedMsg -ForegroundColor Cyan
 }
 
-# FUNCTION TO GET CURRENT TAPE LABEL (MULTI-METHOD FALLBACK)
+# FUNCTION TO GET CURRENT TAPE LABEL (BULLETPROOF METHOD USING 'VOL' COMMAND)
 Function Get-TapeLabel {
     param ([string]$DriveLetter = $TapeDrive)
     
     $driveLetter = $DriveLetter.TrimEnd(':')
-    Log-Message "DEBUG: Attempting to read label for drive $driveLetter"
+    Log-Message "Reading label for drive $driveLetter using vol command"
 
     try {
-        # Method 1: Use Get-Volume (most reliable for NTFS/LTFS)
-        $vol = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
-        if ($vol.FileSystemLabel) {
-            $label = $vol.FileSystemLabel.Trim()
-            Log-Message "SUCCESS: Read tape label via Get-Volume: '$label'"
-            return $label
-        } else {
-            Log-Message "WARNING: Get-Volume found drive $driveLetter but the FileSystemLabel is empty."
-        }
-    } catch {
-        Log-Message "WARNING: Get-Volume failed for drive $driveLetter. Error: $($_.Exception.Message)"
-    }
-
-    try {
-        # Method 2: Use WMI as a fallback (Win32_Volume)
-        $vol = Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter = '$($driveLetter):'" -ErrorAction Stop
-        if ($vol -and $vol.Label) {
-            $label = $vol.Label.Trim()
-            Log-Message "SUCCESS: Read tape label via WMI: '$label'"
-            return $label
-        }
-    } catch {
-        Log-Message "WARNING: WMI method also failed for drive $driveLetter."
-    }
-
-    # Method 3: Final fallback - Check the root directory for a common label file
-    $commonLabelFiles = @("barcode.txt", "volinfo.txt", "label.txt", "tape_id.txt")
-    foreach ($file in $commonLabelFiles) {
-        $labelFilePath = Join-Path -Path "${driveLetter}:\" -ChildPath $file
-        if (Test-Path $labelFilePath) {
-            $label = (Get-Content $labelFilePath -First 1 -ErrorAction SilentlyContinue).Trim()
-            if ($label) {
-                Log-Message "SUCCESS: Read tape label from file '$file': '$label'"
+        # Use the 'vol' command to get the volume label. This is the most reliable way.
+        $volOutput = & cmd.exe /c "vol ${driveLetter}:"
+        
+        # Parse the output to find the label line.
+        # The output looks like: " Volume in drive F is TAPE_001 "
+        $labelLine = $volOutput | Where-Object { $_ -like " Volume in drive*" }
+        
+        # FIXED REGEX: Correctly parses the output to extract the label.
+        if ($labelLine -match "Volume in drive ${driveLetter} is (.+)") {
+            $label = $matches[1].Trim() # Use the first capture group [1]
+            if (-not [string]::IsNullOrEmpty($label)) {
+                Log-Message "SUCCESS: Read tape label: '$label'"
                 return $label
             }
         }
+        # If the regex didn't match or label is empty, check for empty output (no label set)
+        if ($volOutput -like "*has no label*") {
+            Log-Message "Drive $driveLetter has no label set."
+            # Generate a descriptive label
+            $generatedLabel = "Tape_$(Get-Date -Format 'yyyyMMdd_HHmm')"
+            Log-Message "Generated label: '$generatedLabel'"
+            return $generatedLabel
+        }
+        
+    } catch {
+        Log-Message "WARNING: Failed to read volume label for $driveLetter. Error: $($_.Exception.Message)"
     }
 
-    # Ultimate fallback: Generate a unique label based on the date
+    # Ultimate fallback if everything else fails
     $generatedLabel = "Tape_$(Get-Date -Format 'yyyyMMdd_HHmm')"
     Log-Message "WARNING: Could not determine tape label. Generated label: '$generatedLabel'"
     return $generatedLabel
@@ -140,7 +131,7 @@ try {
     if (-not (Test-Path -Path $tapeDriveRoot -PathType Container)) {
         throw "Tape drive root path not found. Is the tape inserted and formatted with LTFS?"
     }
-    $tapeLabel = Get-TapeLabel # This function has its own error handling
+    $tapeLabel = Get-TapeLabel # This function uses the reliable 'vol' command
     Log-Message "Current tape identified: $tapeLabel"
 } catch {
     $errorMsg = "FATAL: Could not validate tape drive $TapeDrive. Error: $($_.Exception.Message)"
