@@ -7,14 +7,16 @@
 # - Comprehensive logging to file and console
 # - Email alert when tape is almost full
 # - Pre-flight checks for source, destination, and dependencies
+# - Only archives folders older than 60 days (based on last write time)
 # ----------------------------
 
 # CONFIGURATION
-$SourceDir = "\\TEST-SRV\sushan"          # Network source to archive
+$SourceDir = "\\Test-SRV\sushan"          # Network source to archive
 $TapeDrive = "F:"                                  # LTO-9 tape drive (LTFS-mounted)
 $IndexFile = "C:\TapeAutomation\TapeIndex.csv"
 $LogFile = "C:\TapeAutomation\Logs\ArchiveLog.txt"
-$TapeFullThreshold = 500GB                         # Reserve buffer to avoid overfill
+$TapeFullThreshold = 16500GB                         # Reserve buffer to avoid overfill
+$DaysThreshold = 60                                # Only archive folders older than this many days
 
 # EMAIL CONFIGURATION
 $EmailFrom   = "sxenix@gmail.com"
@@ -23,7 +25,7 @@ $SMTPServer  = "smtp.gmail.com"
 $SMTPPort    = 587
 $UseSSL      = $true
 $EmailUser   = "sxenix@gmail.com"
-$EmailPass   = "YOUR_APP_PASSWORD"                   # Replace with Google App Password
+$EmailPass   = "YOUR_APP_PASSWORD"                  # Replace with Google App Password
 
 # LOG FUNCTION
 Function Log-Message {
@@ -108,8 +110,20 @@ Function Test-Robocopy {
     }
 }
 
+# FUNCTION TO CHECK IF FOLDER IS OLDER THAN SPECIFIED DAYS
+Function Test-FolderOlderThanDays {
+    param([System.IO.DirectoryInfo]$Folder, [int]$Days)
+    
+    $cutoffDate = (Get-Date).AddDays(-$Days)
+    $isOlder = $Folder.LastWriteTime -lt $cutoffDate
+    
+    Log-Message "Folder '$($Folder.Name)' last write time: $($Folder.LastWriteTime). Cutoff: $cutoffDate. Is older than $Days days: $isOlder"
+    return $isOlder
+}
+
 # --- MAIN SCRIPT EXECUTION STARTS HERE ---
 Log-Message "=== Tape Archiving Job Started ==="
+Log-Message "Only archiving folders older than $DaysThreshold days (last write time before $(Get-Date).AddDays(-$DaysThreshold))"
 
 $EmailSentForCurrentTape = $false  # Prevent duplicate alerts for same tape
 
@@ -145,7 +159,7 @@ try {
 # 3. GET LIST OF FOLDERS TO ARCHIVE
 try {
     $folders = Get-ChildItem -Path $SourceDir -Directory -ErrorAction Stop
-    Log-Message "Found $($folders.Count) folders to process."
+    Log-Message "Found $($folders.Count) folders to evaluate."
 } catch {
     $errorMsg = "ERROR: Could not list directories in $SourceDir. Error: $($_.Exception.Message)"
     Log-Message $errorMsg
@@ -162,9 +176,19 @@ if (-not (Test-Path $IndexFile)) {
 
 # 5. PROCESS EACH FOLDER
 foreach ($folder in $folders) {
-    Log-Message "--- Starting processing for folder: $($folder.Name) ---"
+    Log-Message "--- Evaluating folder: $($folder.Name) ---"
 
-    # CALCULATE FOLDER SIZE
+    # CHECK IF FOLDER IS OLDER THAN 60 DAYS
+    $isOlder = Test-FolderOlderThanDays -Folder $folder -Days $DaysThreshold
+    
+    if (-not $isOlder) {
+        Log-Message "Folder '$($folder.Name)' is NOT older than $DaysThreshold days. Skipping."
+        continue
+    }
+    
+    Log-Message "Folder '$($folder.Name)' is older than $DaysThreshold days. Proceeding with archive."
+
+    # CALCULATE FOLDER SIZE (ENTIRE CONTENTS)
     try {
         $folderSize = (Get-ChildItem $folder.FullName -Recurse -File | Measure-Object -Property Length -Sum -ErrorAction Stop).Sum
         if (-not $folderSize) { $folderSize = 0 }
@@ -212,11 +236,12 @@ foreach ($folder in $folders) {
         }
     }
 
-    # COPY FOLDER TO TAPE USING ROBOCOPY
+    # COPY ENTIRE FOLDER TO TAPE USING ROBOCOPY (NO AGE FILTER)
     $destinationPath = Join-Path -Path $TapeDrive -ChildPath $folder.Name
-    Log-Message "Starting Robocopy to: $destinationPath"
+    Log-Message "Starting Robocopy to: $destinationPath (copying entire folder contents)"
 
     try {
+        # Robocopy WITHOUT age filter - copies all files in the folder
         & robocopy.exe "$($folder.FullName)" "$destinationPath" /MIR /Z /J /R:3 /W:5 /NP /LOG+:$LogFile
 
         if ($LASTEXITCODE -lt 8) {
