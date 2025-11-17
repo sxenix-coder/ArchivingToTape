@@ -10,12 +10,11 @@
 # ----------------------------
 
 # CONFIGURATION
-$SourceDir = "\\Test-Srv\sushan"          # Network source to archive
+$SourceDir = "\\TEST-SRV\sushan"          # Network source to archive
 $TapeDrive = "F:"                                  # LTO-9 tape drive (LTFS-mounted)
 $IndexFile = "C:\TapeAutomation\TapeIndex.csv"
 $LogFile = "C:\TapeAutomation\Logs\ArchiveLog.txt"
-$TapeFullThreshold = 100GB           # Reserve buffer to avoid overfill
-
+$TapeFullThreshold = 500GB                         # Reserve buffer to avoid overfill
 
 # EMAIL CONFIGURATION
 $EmailFrom   = "sxenix@gmail.com"
@@ -24,7 +23,7 @@ $SMTPServer  = "smtp.gmail.com"
 $SMTPPort    = 587
 $UseSSL      = $true
 $EmailUser   = "sxenix@gmail.com"
-$EmailPass   = "YOUR_APP_PASSWORD"                # Replace with Google App Password
+$EmailPass   = "YOUR_APP_PASSWORD"                   # Replace with Google App Password
 
 # LOG FUNCTION
 Function Log-Message {
@@ -44,25 +43,19 @@ Function Get-TapeLabel {
     Log-Message "Reading label for drive $driveLetter using vol command"
 
     try {
-        # Use the 'vol' command to get the volume label. This is the most reliable way.
         $volOutput = & cmd.exe /c "vol ${driveLetter}:"
-        
-        # Parse the output to find the label line.
-        # The output looks like: " Volume in drive F is TAPE_001 "
         $labelLine = $volOutput | Where-Object { $_ -like " Volume in drive*" }
-        
-        # FIXED REGEX: Correctly parses the output to extract the label.
+
         if ($labelLine -match "Volume in drive ${driveLetter} is (.+)") {
-            $label = $matches[1].Trim() # Use the first capture group [1]
+            $label = $matches[1].Trim()
             if (-not [string]::IsNullOrEmpty($label)) {
                 Log-Message "SUCCESS: Read tape label: '$label'"
                 return $label
             }
         }
-        # If the regex didn't match or label is empty, check for empty output (no label set)
+
         if ($volOutput -like "*has no label*") {
             Log-Message "Drive $driveLetter has no label set."
-            # Generate a descriptive label
             $generatedLabel = "Tape_$(Get-Date -Format 'yyyyMMdd_HHmm')"
             Log-Message "Generated label: '$generatedLabel'"
             return $generatedLabel
@@ -72,7 +65,6 @@ Function Get-TapeLabel {
         Log-Message "WARNING: Failed to read volume label for $driveLetter. Error: $($_.Exception.Message)"
     }
 
-    # Ultimate fallback if everything else fails
     $generatedLabel = "Tape_$(Get-Date -Format 'yyyyMMdd_HHmm')"
     Log-Message "WARNING: Could not determine tape label. Generated label: '$generatedLabel'"
     return $generatedLabel
@@ -82,7 +74,16 @@ Function Get-TapeLabel {
 Function Send-TapeFullEmail {
     param($tapeLabel, $freeSpace)
     $subject = "Tape Storage Almost Full: $tapeLabel"
-    $body = "Attention: Tape '$tapeLabel' is running low on space.`nRemaining space: $([Math]::Round($freeSpace/1GB,2)) GB`nPlease prepare the next tape."
+    $body = @"
+Tape Storage Almost Full 
+
+Tape Label: $tapeLabel
+Remaining Free Space: $([Math]::Round($freeSpace/1GB,2)) GB
+
+Please prepare and insert the next tape to continue archiving.
+
+This is an automated message from the Tape Archiving System.
+"@
    
     try {
         $securePass = ConvertTo-SecureString $EmailPass -AsPlainText -Force
@@ -110,6 +111,8 @@ Function Test-Robocopy {
 # --- MAIN SCRIPT EXECUTION STARTS HERE ---
 Log-Message "=== Tape Archiving Job Started ==="
 
+$EmailSentForCurrentTape = $false  # Prevent duplicate alerts for same tape
+
 # 0. PREREQUISITE CHECK: Is Robocopy available?
 if (-not (Test-Robocopy)) {
     throw "Prerequisite check failed. Exiting."
@@ -131,7 +134,7 @@ try {
     if (-not (Test-Path -Path $tapeDriveRoot -PathType Container)) {
         throw "Tape drive root path not found. Is the tape inserted and formatted with LTFS?"
     }
-    $tapeLabel = Get-TapeLabel # This function uses the reliable 'vol' command
+    $tapeLabel = Get-TapeLabel
     Log-Message "Current tape identified: $tapeLabel"
 } catch {
     $errorMsg = "FATAL: Could not validate tape drive $TapeDrive. Error: $($_.Exception.Message)"
@@ -149,7 +152,7 @@ try {
     throw $errorMsg
 }
 
-# 4. INITIALIZE INDEX FILE (if it doesn't exist)
+# 4. INITIALIZE INDEX FILE
 if (-not (Test-Path $IndexFile)) {
     $indexDir = Split-Path $IndexFile -Parent
     if (-not (Test-Path $indexDir)) { New-Item -Path $indexDir -ItemType Directory -Force | Out-Null }
@@ -164,14 +167,14 @@ foreach ($folder in $folders) {
     # CALCULATE FOLDER SIZE
     try {
         $folderSize = (Get-ChildItem $folder.FullName -Recurse -File | Measure-Object -Property Length -Sum -ErrorAction Stop).Sum
-        if (-not $folderSize) { $folderSize = 0 } # Handle empty folders
+        if (-not $folderSize) { $folderSize = 0 }
         Log-Message "Calculated folder size: $([Math]::Round($folderSize/1GB, 2)) GB"
     } catch {
         Log-Message "ERROR calculating size for $($folder.Name): $($_.Exception.Message). Skipping."
         continue
     }
 
-    # CHECK TAPE FREE SPACE (Refresh this before each folder)
+    # CHECK TAPE FREE SPACE (REFRESH BEFORE EACH COPY)
     try {
         $tapeDriveInfo = Get-PSDrive -Name $TapeDrive.TrimEnd(':') -ErrorAction Stop
         $freeSpace = $tapeDriveInfo.Free
@@ -184,20 +187,24 @@ foreach ($folder in $folders) {
     # CHECK IF TAPE HAS ENOUGH SPACE
     if (($folderSize + $TapeFullThreshold) -gt $freeSpace) {
         Log-Message "WARNING: Tape '$tapeLabel' has insufficient space for folder '$($folder.Name)'."
-        Send-TapeFullEmail -tapeLabel $tapeLabel -freeSpace $freeSpace
+
+        if (-not $EmailSentForCurrentTape) {
+            Send-TapeFullEmail -tapeLabel $tapeLabel -freeSpace $freeSpace
+            $EmailSentForCurrentTape = $true
+        }
 
         Write-Host "Please insert a new tape and ensure it is formatted and mounted as $TapeDrive. Press Enter to continue, or Ctrl+C to abort..." -ForegroundColor Yellow
         Read-Host
 
         # Refresh tape info after swap
         try {
-            # Re-check the drive is accessible
             if (-not (Test-Path -Path $tapeDriveRoot -PathType Container)) {
                 throw "New tape drive path not found after swap."
             }
             $tapeLabel = Get-TapeLabel
             $tapeDriveInfo = Get-PSDrive -Name $TapeDrive.TrimEnd(':')
             $freeSpace = $tapeDriveInfo.Free
+            $EmailSentForCurrentTape = $false  # Reset flag for new tape
             Log-Message "New tape loaded: $tapeLabel. Free space: $([Math]::Round($freeSpace/1GB,2)) GB"
         } catch {
             Log-Message "FATAL: Failed to access new tape. Aborting."
@@ -205,26 +212,15 @@ foreach ($folder in $folders) {
         }
     }
 
-    # COPY FOLDER TO TAPE USING ROBOCPY
+    # COPY FOLDER TO TAPE USING ROBOCOPY
     $destinationPath = Join-Path -Path $TapeDrive -ChildPath $folder.Name
     Log-Message "Starting Robocopy to: $destinationPath"
 
     try {
         & robocopy.exe "$($folder.FullName)" "$destinationPath" /MIR /Z /J /R:3 /W:5 /NP /LOG+:$LogFile
-        # /MIR: Mirror mode (copies all data and purges deleted files on destination)
-        # /Z: restartable mode
-        # /J: unbuffered I/O (good for large files)
-        # /R:3: retry 3 times
-        # /W:5: wait 5 sec between retries
-        # /NP: No Progress (keeps log readable)
-        # /LOG+: Append to log file
 
-        # Check Robocopy's exit code
         if ($LASTEXITCODE -lt 8) {
-            # Exit codes 0-7 are success or partial success
             Log-Message "SUCCESS: Robocopy finished for $($folder.Name). Exit code: $LASTEXITCODE"
-
-            # UPDATE INDEX
             $entry = "$($folder.FullName),$tapeLabel,$folderSize,$(Get-Date -Format yyyy-MM-dd)"
             Add-Content -Path $IndexFile -Value $entry
             Log-Message "Index updated for $($folder.Name)."
@@ -234,6 +230,7 @@ foreach ($folder in $folders) {
     } catch {
         Log-Message "ERROR during Robocopy operation: $($_.Exception.Message)"
     }
+
     Log-Message "--- Finished processing folder: $($folder.Name) ---"
 }
 
